@@ -54,6 +54,26 @@ export interface ModeStateFileRef {
   scope: StateFileScope;
 }
 
+function safeStateString(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+export function canUseRootModeStateFallback(
+  state: Record<string, unknown>,
+  sessionId?: string,
+): boolean {
+  const normalizedSessionId = safeStateString(sessionId);
+  if (!normalizedSessionId || state.active !== true) return true;
+
+  const ownerSessionId = safeStateString(
+    state.session_id
+      ?? state.owner_omx_session_id
+      ?? state.omx_session_id
+      ?? state.owner_session_id,
+  );
+  return Boolean(ownerSessionId && ownerSessionId === normalizedSessionId);
+}
+
 export function validateSessionId(sessionId: unknown): string | undefined {
   if (sessionId == null) return undefined;
   if (typeof sessionId !== 'string') {
@@ -590,14 +610,22 @@ export async function listModeStateFilesWithScopePreference(
   workingDirectory?: string,
   explicitSessionId?: string,
 ): Promise<ModeStateFileRef[]> {
+  const stateScope = await resolveStateScope(workingDirectory, explicitSessionId);
   const readDirs = await getReadScopedStateDirs(workingDirectory, explicitSessionId);
   const rootDir = getBaseStateDir(workingDirectory);
+  const sessionId = stateScope.source === 'root' ? undefined : stateScope.sessionId;
   const preferred = new Map<string, ModeStateFileRef>();
 
   // Compatibility fallback: root first, then higher-precedence scope overrides.
   for (const dir of [...readDirs].reverse()) {
     const scope: StateFileScope = dir === rootDir ? 'root' : 'session';
     for (const ref of await listModeStateFilesInDir(dir, scope)) {
+      if (scope === 'root' && sessionId) {
+        const data = await readFile(ref.path, 'utf-8')
+          .then((content) => JSON.parse(content) as Record<string, unknown>)
+          .catch(() => null);
+        if (data && !canUseRootModeStateFallback(data, sessionId)) continue;
+      }
       preferred.set(ref.mode, ref);
     }
   }

@@ -617,6 +617,50 @@ describe("codex native hook dispatch", () => {
     }
   });
 
+  it("fails open before Codex timeout when Stop plugin dispatch hangs", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-cli-stop-deadline-"));
+    try {
+      const hooksDir = join(cwd, ".omx", "hooks");
+      await mkdir(hooksDir, { recursive: true });
+      await writeFile(
+        join(hooksDir, "hang.mjs"),
+        `export async function onHookEvent() {
+          process.on("SIGTERM", () => {});
+          setInterval(() => {}, 60_000);
+          await new Promise(() => {});
+        }`,
+      );
+
+      const startedAt = Date.now();
+      const result = spawnSync(process.execPath, [nativeHookScriptPath()], {
+        cwd,
+        input: JSON.stringify({
+          hook_event_name: "Stop",
+          cwd,
+          session_id: "sess-stop-deadline",
+          thread_id: "thread-stop-deadline",
+          turn_id: "turn-stop-deadline",
+        }),
+        encoding: "utf-8",
+        stdio: ["pipe", "pipe", "pipe"],
+        timeout: 2_000,
+        env: {
+          ...process.env,
+          OMX_HOOK_PLUGINS: "1",
+          OMX_HOOK_PLUGIN_TIMEOUT_MS: "60000",
+          OMX_NATIVE_STOP_DEADLINE_MS: "100",
+        },
+      });
+      const elapsedMs = Date.now() - startedAt;
+
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+      assert.deepEqual(parseSingleJsonStdout(result.stdout), {});
+      assert.ok(elapsedMs < 1_500, `Stop CLI should fail open promptly (elapsed=${elapsedMs}ms)`);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("returns empty JSON for oversized Stop stdin without parsing or creating inactive state", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-cli-stop-oversized-"));
     try {
@@ -1807,6 +1851,9 @@ describe("codex native hook dispatch", () => {
     try {
       await writeFile(join(cwd, ".gitignore"), "node_modules/\n");
       execFileSync("git", ["init"], { cwd, stdio: "pipe" });
+      const emptyExcludesFile = join(cwd, "empty-excludes");
+      await writeFile(emptyExcludesFile, "");
+      execFileSync("git", ["config", "core.excludesfile", emptyExcludesFile], { cwd, stdio: "pipe" });
 
       const result = await dispatchCodexNativeHook(
         {
@@ -1836,6 +1883,9 @@ describe("codex native hook dispatch", () => {
     try {
       await writeFile(join(cwd, ".gitignore"), "node_modules/\n.omx/\n");
       execFileSync("git", ["init"], { cwd, stdio: "pipe" });
+      const emptyExcludesFile = join(cwd, "empty-excludes");
+      await writeFile(emptyExcludesFile, "");
+      execFileSync("git", ["config", "core.excludesfile", emptyExcludesFile], { cwd, stdio: "pipe" });
 
       const result = await dispatchCodexNativeHook(
         {

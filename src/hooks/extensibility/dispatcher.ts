@@ -31,6 +31,37 @@ interface RunnerResult {
 const RESULT_PREFIX = "__OMX_PLUGIN_RESULT__ ";
 const RUNNER_SIGKILL_GRACE_MS = 250;
 
+function normalizeDispatchDeadlineMs(value: unknown): number | null {
+	if (typeof value !== "number" || !Number.isFinite(value)) return null;
+	const rounded = Math.floor(value);
+	return rounded > 0 ? rounded : null;
+}
+
+function remainingDispatchDeadlineMs(
+	startedAt: number,
+	deadlineMs: number | null,
+): number | null {
+	if (deadlineMs === null) return null;
+	return Math.max(0, deadlineMs - (Date.now() - startedAt));
+}
+
+function buildDeadlineSkippedPluginResult(
+	plugin: { id: string; path: string; file: string },
+): HookPluginDispatchResult {
+	return {
+		plugin: plugin.id,
+		path: plugin.path,
+		file: plugin.file,
+		plugin_id: plugin.id,
+		ok: false,
+		status: "skipped",
+		skipped: true,
+		reason: "deadline_exceeded",
+		durationMs: 0,
+		duration_ms: 0,
+	};
+}
+
 function hooksLogPath(cwd: string): string {
 	const day = new Date().toISOString().slice(0, 10);
 	return join(omxRoot(cwd), "logs", `hooks-${day}.jsonl`);
@@ -308,8 +339,10 @@ export async function dispatchHookEvent(
 	event: HookEventEnvelope,
 	options: HookDispatchOptions = {},
 ): Promise<HookDispatchResult> {
+	const startedAt = Date.now();
 	const cwd = options.cwd || process.cwd();
 	const env = options.env || process.env;
+	const deadlineMs = normalizeDispatchDeadlineMs(options.deadlineMs);
 	const runtimeHookDispatchEnabled =
 		shouldForceEnableRuntimeHookDispatch(event) || isHookPluginsEnabled(env);
 	const enabled = options.enabled ?? runtimeHookDispatchEnabled;
@@ -370,10 +403,32 @@ export async function dispatchHookEvent(
 		options.sideEffectsEnabled ?? (!inTeamWorker || allowTeamSideEffects);
 
 	for (const plugin of plugins) {
+		const remainingMs = remainingDispatchDeadlineMs(startedAt, deadlineMs);
+		if (remainingMs !== null && remainingMs <= 0) {
+			const result = buildDeadlineSkippedPluginResult(plugin);
+			summary.results.push(result);
+			await appendHooksLog(cwd, {
+				type: "hook_plugin_dispatch",
+				event: event.event,
+				source: event.source,
+				plugin: plugin.id,
+				file: plugin.file,
+				ok: result.ok,
+				status: result.status,
+				reason: result.reason,
+				duration_ms: result.duration_ms,
+			});
+			continue;
+		}
+		const pluginTimeoutMs = options.timeoutMs ?? resolveHookPluginTimeoutMs(env);
+		const effectiveTimeoutMs =
+			remainingMs === null
+				? pluginTimeoutMs
+				: Math.max(1, Math.min(pluginTimeoutMs, remainingMs));
 		const result = await runPluginRunner(
 			plugin,
 			event,
-			{ ...options, cwd, env },
+			{ ...options, cwd, env, timeoutMs: effectiveTimeoutMs },
 			sideEffectsEnabled,
 		);
 		summary.results.push(result);

@@ -87,6 +87,27 @@ describe('CLI session-scoped state parity', () => {
     }
   });
 
+  it('status ignores unowned root active state when a current session exists', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-cli-session-root-stale-'));
+    try {
+      const stateDir = join(wd, '.omx', 'state');
+      await mkdir(stateDir, { recursive: true });
+      await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: 'sess-current' }));
+      await writeFile(join(stateDir, 'deep-interview-state.json'), JSON.stringify({
+        active: true,
+        mode: 'deep-interview',
+        current_phase: 'legacy-root-active',
+      }));
+
+      const statusResult = runOmx(wd, 'status');
+      assert.equal(statusResult.status, 0, statusResult.stderr || statusResult.stdout);
+      assert.doesNotMatch(statusResult.stdout, /deep-interview: ACTIVE/);
+      assert.match(statusResult.stdout, /No active modes\./);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
   it('cancels linked ultrawork when Ralph is active', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-cli-ralph-link-'));
     try {

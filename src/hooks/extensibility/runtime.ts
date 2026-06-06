@@ -33,6 +33,7 @@ export async function dispatchHookEventRuntime(input: HookRuntimeDispatchInput):
 
   const result = await dispatchHookEvent(input.event, {
     cwd: input.cwd,
+    deadlineMs: input.deadlineMs,
     allowTeamWorkerSideEffects: input.allowTeamWorkerSideEffects,
     enabled,
   });

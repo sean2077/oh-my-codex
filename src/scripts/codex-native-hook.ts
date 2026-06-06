@@ -131,6 +131,7 @@ type CodexHookPayload = Record<string, unknown>;
 interface NativeHookDispatchOptions {
   cwd?: string;
   sessionOwnerPid?: number;
+  stopDeadlineMs?: number;
   reconcileHudForPromptSubmitFn?: typeof reconcileHudForPromptSubmit;
 }
 
@@ -146,6 +147,11 @@ const SKILL_STOP_BLOCKERS = new Set(["ralplan"]);
 const TEAM_STOP_BLOCKING_TASK_STATUSES = new Set(["pending", "in_progress", "blocked"]);
 const TEAM_WORKER_TERMINAL_RUN_STATES = new Set(["done", "complete", "completed", "failed", "stopped", "cancelled"]);
 const NATIVE_STOP_STATE_FILE = "native-stop-state.json";
+const NATIVE_STOP_DEADLINE_ENV = "OMX_NATIVE_STOP_DEADLINE_MS";
+const DEFAULT_NATIVE_STOP_DEADLINE_MS = 4_000;
+const MIN_NATIVE_STOP_DEADLINE_MS = 100;
+const MAX_NATIVE_STOP_DEADLINE_MS = 25_000;
+const NATIVE_STOP_DISPATCH_EXIT_GRACE_MS = 500;
 const ORDINARY_STOP_NO_PROGRESS_DEFAULT_MAX_REPEATS = 8;
 const RALPH_ORPHANED_STARTING_STALE_MS = 15 * 60_000;
 const ORDINARY_STOP_NO_PROGRESS_DEFAULT_IDLE_MS = 10 * 60_000;
@@ -3303,6 +3309,23 @@ function buildRepeatableStopSignature(
   ].join("|");
 }
 
+function readNativeStopDeadlineMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env[NATIVE_STOP_DEADLINE_ENV];
+  if (typeof raw !== "string" || raw.trim() === "") return DEFAULT_NATIVE_STOP_DEADLINE_MS;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed)) return DEFAULT_NATIVE_STOP_DEADLINE_MS;
+  const rounded = Math.floor(parsed);
+  return Math.min(
+    MAX_NATIVE_STOP_DEADLINE_MS,
+    Math.max(MIN_NATIVE_STOP_DEADLINE_MS, rounded),
+  );
+}
+
+function remainingNativeStopDeadlineMs(startedAt: number, deadlineMs?: number): number | undefined {
+  if (typeof deadlineMs !== "number" || !Number.isFinite(deadlineMs)) return undefined;
+  return Math.max(1, deadlineMs - NATIVE_STOP_DISPATCH_EXIT_GRACE_MS - (Date.now() - startedAt));
+}
+
 function formatStopStatePath(cwd: string, statePath: string): string {
   const relativePath = relative(cwd, statePath);
   if (!relativePath || relativePath.startsWith("..")) return statePath;
@@ -4051,6 +4074,7 @@ export async function dispatchCodexNativeHook(
   payload: CodexHookPayload,
   options: NativeHookDispatchOptions = {},
 ): Promise<NativeHookDispatchResult> {
+  const startedAt = Date.now();
   const hookEventName = readHookEventName(payload);
   const cwd = options.cwd ?? (safeString(payload.cwd).trim() || process.cwd());
   if (hookEventName === "Stop" && !hasNativeStopRuntimeSurface(cwd)) {
@@ -4309,6 +4333,9 @@ export async function dispatchCodexNativeHook(
     await dispatchHookEventRuntime({
       event,
       cwd,
+      deadlineMs: hookEventName === "Stop"
+        ? remainingNativeStopDeadlineMs(startedAt, options.stopDeadlineMs)
+        : undefined,
       allowTeamWorkerSideEffects: false,
     });
   }
@@ -4622,6 +4649,34 @@ export async function runCodexNativeHookCli(): Promise<void> {
     return;
   }
 
+  const isStopHook = readHookEventName(payload) === "Stop";
+  const stopDeadlineMs = isStopHook ? readNativeStopDeadlineMs() : undefined;
+  let stopDeadlineTimer: NodeJS.Timeout | undefined;
+  let cliOutputWritten = false;
+  const writeCliOutput = (output: Record<string, unknown>): boolean => {
+    if (cliOutputWritten) return false;
+    cliOutputWritten = true;
+    writeNativeHookJsonStdout(output);
+    return true;
+  };
+  if (isStopHook && stopDeadlineMs !== undefined) {
+    const cwd = safeString(payload.cwd).trim() || process.cwd();
+    stopDeadlineTimer = setTimeout(() => {
+      if (cliOutputWritten) return;
+      cliOutputWritten = true;
+      process.stderr.write(
+        `[omx] codex-native Stop hook exceeded internal deadline (${stopDeadlineMs}ms); failing open before Codex hook timeout.\n`,
+      );
+      void logNativeHookCliError(
+        cwd,
+        "native_stop_deadline_exceeded",
+        new Error(`native Stop exceeded ${stopDeadlineMs}ms internal deadline`),
+        payload,
+      );
+      process.stdout.write(`${JSON.stringify({})}\n`, () => process.exit(0));
+    }, stopDeadlineMs);
+  }
+
   try {
     if (isStopDispatchFailureTestTrigger(payload)) {
       throw new Error("test-induced Stop dispatch failure");
@@ -4630,20 +4685,22 @@ export async function runCodexNativeHookCli(): Promise<void> {
       throw new Error("test-induced dispatch failure");
     }
 
-    const result = await dispatchCodexNativeHook(payload);
+    const result = await dispatchCodexNativeHook(payload, { stopDeadlineMs });
     if (result.outputJson) {
-      writeNativeHookJsonStdout(result.outputJson);
+      writeCliOutput(result.outputJson);
     } else if (result.hookEventName === "Stop") {
-      writeNativeHookJsonStdout({});
+      writeCliOutput({});
     }
   } catch (error) {
     const cwd = safeString(payload.cwd).trim() || process.cwd();
     await logNativeHookCliError(cwd, "native_hook_dispatch_error", error, payload);
     if (readHookEventName(payload) === "Stop") {
-      writeNativeHookJsonStdout(buildStopDispatchFailureOutput(error));
+      writeCliOutput(buildStopDispatchFailureOutput(error));
     } else {
       process.exitCode = 1;
     }
+  } finally {
+    if (stopDeadlineTimer) clearTimeout(stopDeadlineTimer);
   }
 }
 

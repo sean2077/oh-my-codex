@@ -206,6 +206,7 @@ export interface HookDispatchOptions {
   event?: HookEventEnvelope;
   env?: NodeJS.ProcessEnv;
   timeoutMs?: number;
+  deadlineMs?: number;
   allowInTeamWorker?: boolean;
   allowTeamWorkerSideEffects?: boolean;
   sideEffectsEnabled?: boolean;
@@ -221,6 +222,7 @@ export interface HookValidateOptions {
 export interface HookRuntimeDispatchInput {
   cwd: string;
   event: HookEventEnvelope;
+  deadlineMs?: number;
   allowTeamWorkerSideEffects?: boolean;
   sideEffectsEnabled?: boolean;
 }

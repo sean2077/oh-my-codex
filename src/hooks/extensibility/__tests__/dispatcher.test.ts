@@ -260,6 +260,44 @@ export async function onHookEvent() {}
     }
   });
 
+  it('skips remaining plugins after the aggregate dispatch deadline is exhausted', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-dispatch-deadline-'));
+    try {
+      const dir = join(cwd, '.omx', 'hooks');
+      await mkdir(dir, { recursive: true });
+      for (const name of ['a-slow.mjs', 'b-slow.mjs']) {
+        await writeFile(
+          join(dir, name),
+          `export async function onHookEvent() {
+            process.on('SIGTERM', () => {});
+            setInterval(() => {}, 60_000);
+            await new Promise(() => {});
+          }`,
+        );
+      }
+
+      const event = buildHookEvent('session-start');
+      const startedAt = Date.now();
+      const result = await dispatchHookEvent(event, {
+        cwd,
+        timeoutMs: 500,
+        deadlineMs: 80,
+        env: { ...process.env, OMX_HOOK_PLUGINS: '1' },
+      });
+      const elapsedMs = Date.now() - startedAt;
+
+      assert.equal(result.enabled, true);
+      assert.equal(result.plugin_count, 2);
+      assert.equal(result.results.length, 2);
+      assert.equal(result.results[0].status, 'timeout');
+      assert.equal(result.results[1].status, 'skipped');
+      assert.equal(result.results[1].reason, 'deadline_exceeded');
+      assert.ok(elapsedMs < 1_500, `dispatch should honor aggregate deadline promptly (elapsed=${elapsedMs}ms)`);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it('dedupes repeated native lifecycle hook dispatches for the same session/turn fingerprint', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-dispatch-dedupe-'));
     try {
